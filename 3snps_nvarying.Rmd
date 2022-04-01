@@ -1,0 +1,363 @@
+---
+title: "Finemapping with missing data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{R include=FALSE}
+log.dmvnorm <- function(x, mu = rep(0, length(x)), S = diag(1, length(x)) ){
+  #returns log of density of MV-Normal(mean = mu, var = S) at x 
+  K = length(mu)
+  stopifnot(all(dim(S) == K))
+  stopifnot(length(x) == K)
+  chol.S = chol(S) #Cholesky decomposition
+  log.det = 2*sum(log(diag(chol.S))) #log of det(S)
+  inv.chol.S = solve(t(chol.S)) #inverse of cholesky^T
+  return(-K/2*log(2*pi) - 0.5*(log.det + crossprod(inv.chol.S %*% (x-mu))))
+}
+```
+
+```{R}
+library(MASS)
+set.seed(6)
+
+p = 3
+#f = runif(p, 0.1, 0.5)
+tau = 0.1
+lambda.true = c(0.0, 0.08, 0.0) # true config: 0,1,0 #0.05
+f = rep(0.4, p)
+
+# prior for config sizes
+pk = rep(NA, 4)
+for (k in 1:4) {
+  pk[k] = choose(p, k)*(1/p)^k*((p-1)/p)^(p-k)
+}
+
+# LD matrix
+A = matrix(runif(p^2), ncol=p) 
+B = t(A) %*% A
+R = cov2cor(B)
+
+
+# matrix encoding causal configs
+C = matrix(NA, 2^p, p)
+for (i in 1:p) {
+  C[,i] = rep(c(rep(1,2^(i-1)), rep(0,2^(i-1))), 2^p/(2^i))
+}
+for (i in rev(1:2^p)) {
+  if(sum(C[i,])>4 | sum(C[i,])==0) {
+    C = C[-i,]
+  }
+}
+true = 6
+
+niter = 1000
+n1 = 10000
+n2.range = round(seq(n1, 0.5*n1, length.out=100),-1)
+#res = matrix(NA, niter, length(n2.range))
+res = array(NA, c(niter, length(n2.range), 12)) # 12 layers = posterior of true config + PIPs for all 3 SNPs, first with full info, then with lower dim, then with causals only
+for (kk in 1:length(n2.range)) {
+  
+  # sample sizes and overlaps
+  n2 = n2.range[kk]
+  #N = matrix(c(n1,n1,n1,n1,n2,n2,n1,n2,n2), 3,3, byrow=T)
+  N = matrix(c(n1,rep(n2,8)),3,3,byrow=T)
+  n = diag(N)
+  M = matrix(NA, p, p)
+  for (i in 1:p) {
+    for (j in 1:p) {
+      M[i,j] = N[i,j]/sqrt(n[i]*n[j])
+    }
+  }
+  
+  # marginal effects and their SEs
+  sc = sqrt(2*f*(1-f))
+  lambda.sc = sc*lambda.true
+  beta.sc = R %*% lambda.sc
+  beta = beta.sc/sc
+  SE.b.sc = c(sqrt( (1-beta^2*2*f*(1-f))/n ))
+  S = diag(SE.b.sc)
+  Sigma = S %*% (R*M) %*% S
+  
+  for (iter in 1:niter) {
+    
+    betahat.sc = mvrnorm(n = 1, mu = beta.sc, Sigma = Sigma)
+    log.bf = rep(NA, nrow(C))
+    for (i in 1:nrow(C)) {
+      log.bf[i] = log.dmvnorm(betahat.sc, mu = rep(0,p), S = Sigma + R %*% diag(tau^2*C[i,]) %*% R ) - 
+        log.dmvnorm(betahat.sc, mu = rep(0,p), S = Sigma)
+    }
+    
+    #### full info calc
+    
+    bf = exp(log.bf - max(log.bf))
+    
+    # unnormalized posterior for each config 
+    p_ = rep(NA, nrow(C))
+    for (i in 1:nrow(C)) {
+      k = sum(C[i,])
+      p_[i] = bf[i]*pk[k]/choose(p,k)
+    }
+    
+    # normalized posterior
+    posterior.config = (p_)/sum(p_)
+    
+    # PIPs
+    post.ip = rep(0, p)
+    for (snp in 1:p) {
+      for (config in 1:nrow(C)) {
+        if(C[config, snp]==1) {
+          post.ip[snp] = post.ip[snp] + posterior.config[config]
+        }
+      }
+    }
+    
+    res[iter, kk, 1] = posterior.config[true]
+    res[iter, kk, 2:4] = post.ip    
+    
+    #### SNPs 2 and 3 have full overlap, so configs (0,1,0) and (0,0,1) will be evaluated with causal SNP dimension only
+    
+    log.bf[4] = log.dmvnorm(betahat.sc[3], mu = rep(0,1), 
+                              S = (Sigma + R %*% diag(tau^2*c(0,0,1)) %*% R)[3,3] ) - 
+        log.dmvnorm(betahat.sc[3], mu = rep(0,1), S = Sigma[3,3])
+    log.bf[6] = log.dmvnorm(betahat.sc[2], mu = rep(0,1), 
+                              S = (Sigma + R %*% diag(tau^2*c(0,1,0)) %*% R)[2,2] ) - 
+        log.dmvnorm(betahat.sc[2], mu = rep(0,1), S = Sigma[2,2])
+    
+    
+    bf = exp(log.bf - max(log.bf))
+    
+    # unnormalized posterior for each config 
+    p_ = rep(NA, nrow(C))
+    for (i in 1:nrow(C)) {
+      k = sum(C[i,])
+      p_[i] = bf[i]*pk[k]/choose(p,k)
+    }
+    
+    # normalized posterior
+    posterior.config = (p_)/sum(p_)
+    
+    # PIPs
+    post.ip = rep(0, p)
+    for (snp in 1:p) {
+      for (config in 1:nrow(C)) {
+        if(C[config, snp]==1) {
+          post.ip[snp] = post.ip[snp] + posterior.config[config]
+        }
+      }
+    }
+    
+    res[iter, kk, 5] = posterior.config[true]
+    res[iter, kk, 6:8] = post.ip
+    
+    ### standard finemapping with causal SNPs only
+    
+    for (i in 1:nrow(C)) {
+      cs = which(C[i,]==1)
+      log.bf[i] = log.dmvnorm(betahat.sc[cs], mu = rep(0,length(cs)), S = (Sigma + R %*% diag(tau^2*C[i,]) %*% R)[cs,cs] ) - 
+        log.dmvnorm(betahat.sc[cs], mu = rep(0,length(cs)), S = Sigma[cs,cs])
+    }
+    
+    bf = exp(log.bf - max(log.bf))
+    
+    # unnormalized posterior for each config 
+    p_ = rep(NA, nrow(C))
+    for (i in 1:nrow(C)) {
+      k = sum(C[i,])
+      p_[i] = bf[i]*pk[k]/choose(p,k)
+    }
+    
+    # normalized posterior
+    posterior.config = (p_)/sum(p_)
+    
+    # PIPs
+    post.ip = rep(0, p)
+    for (snp in 1:p) {
+      for (config in 1:nrow(C)) {
+        if(C[config, snp]==1) {
+          post.ip[snp] = post.ip[snp] + posterior.config[config]
+        }
+      }
+    }
+    
+    res[iter, kk, 9] = posterior.config[true]
+    res[iter, kk, 10:12] = post.ip    
+    
+  }
+  
+}
+
+y = apply(res[,,1], 2, mean)
+y2 = apply(res[,,5], 2, mean)
+y3 = apply(res[,,9], 2, mean)
+
+plot((n2.range-n1)/n1, y, xlim=rev(range(n2.range-n1)/n1), ylim=c(0.9, 1.1)*range(y2), pch = 16,
+     xlab = "relative sample size difference between non-causal and causal SNPs", col=3,
+     ylab = "posterior of true configuration", main = "error when SNPs with full overlap dropped from calculations")
+lines((n2.range-n1)/n1, glm(y~poly(n2.range,2),family = "gaussian")$fitted.values, col=3, lwd=2)
+
+points((n2.range-n1)/n1, y2, col = 2, pch = 16)
+lines((n2.range-n1)/n1, glm(y2~poly(n2.range,2),family = "gaussian")$fitted.values, col=2, lwd=2)
+
+points((n2.range-n1)/n1, y3, col = 4, pch = 16)
+lines((n2.range-n1)/n1, glm(y3~poly(n2.range,2),family = "gaussian")$fitted.values, col=4, lwd=2)
+
+legend("bottomleft",legend = c("full information", "ignoring full ovelap SNPs", "ignoring all non-causals"), col=c(3,2,4), lwd=c(2,2,2), cex = 0.8)
+```
+
+
+
+```{R}
+set.seed(6)
+
+p = 3
+#f = runif(p, 0.1, 0.5)
+tau = 0.1
+lambda.true = c(0.0, 0.08, 0.0) # true config: 0,1,0 #0.05
+f = rep(0.4, p)
+
+# prior for config sizes
+pk = rep(NA, 4)
+for (k in 1:4) {
+  pk[k] = choose(p, k)*(1/p)^k*((p-1)/p)^(p-k)
+}
+
+n1 = 10000
+n2.range = c(8000,7000,6000,5000)
+r.range = seq(0, 0.9, by = 0.01)
+niter = 500
+
+res = array(NA, c(niter, length(r.range), length(n2.range), 2)) # 2 layers: full dim calc and then ignoring full overlap SNPs
+
+for (hh in 1:length(n2.range)) {
+  n2 = n2.range[hh]
+  N = matrix(c(n1,rep(n2,8)),3,3,byrow=T)
+  n = diag(N)
+  M = matrix(NA, p, p)
+  for (i in 1:p) {
+    for (j in 1:p) {
+      M[i,j] = N[i,j]/sqrt(n[i]*n[j])
+    }
+  }
+  
+  for (ii in 1:length(r.range)) {
+    r = r.range[ii]
+    R = matrix(r, p, p)
+    diag(R) = 1
+    
+    # marginal effects and their SEs
+    sc = sqrt(2*f*(1-f))
+    lambda.sc = sc*lambda.true
+    beta.sc = R %*% lambda.sc
+    beta = beta.sc/sc
+    SE.b.sc = c(sqrt( (1-beta^2*2*f*(1-f))/n ))
+    S = diag(SE.b.sc)
+    Sigma = S %*% (R*M) %*% S
+    
+    for (iter in 1:niter) {
+      betahat.sc = mvrnorm(n = 1, mu = beta.sc, Sigma = Sigma)
+      log.bf = rep(NA, nrow(C))
+      for (i in 1:nrow(C)) {
+        log.bf[i] = log.dmvnorm(betahat.sc, mu = rep(0,p), S = Sigma + R %*% diag(tau^2*C[i,]) %*% R ) - 
+          log.dmvnorm(betahat.sc, mu = rep(0,p), S = Sigma)
+      }
+      
+      #### full info calc
+      
+      bf = exp(log.bf - max(log.bf))
+      
+      # unnormalized posterior for each config 
+      p_ = rep(NA, nrow(C))
+      for (i in 1:nrow(C)) {
+        k = sum(C[i,])
+        p_[i] = bf[i]*pk[k]/choose(p,k)
+      }
+      
+      # normalized posterior
+      posterior.config = (p_)/sum(p_)
+      
+      # PIPs
+      # post.ip = rep(0, p)
+      # for (snp in 1:p) {
+      #   for (config in 1:nrow(C)) {
+      #     if(C[config, snp]==1) {
+      #       post.ip[snp] = post.ip[snp] + posterior.config[config]
+      #     }
+      #   }
+      # }
+      
+      res[iter,ii,hh,1] = posterior.config[true]
+      
+      #### SNPs 2 and 3 have full overlap, so configs (0,1,0) and (0,0,1) will be evaluated with causal SNP dimension only
+    
+      log.bf[4] = log.dmvnorm(betahat.sc[3], mu = rep(0,1), 
+                                S = (Sigma + R %*% diag(tau^2*c(0,0,1)) %*% R)[3,3] ) - 
+          log.dmvnorm(betahat.sc[3], mu = rep(0,1), S = Sigma[3,3])
+      log.bf[6] = log.dmvnorm(betahat.sc[2], mu = rep(0,1), 
+                                S = (Sigma + R %*% diag(tau^2*c(0,1,0)) %*% R)[2,2] ) - 
+          log.dmvnorm(betahat.sc[2], mu = rep(0,1), S = Sigma[2,2])
+      
+      
+      bf = exp(log.bf - max(log.bf))
+      
+      # unnormalized posterior for each config 
+      p_ = rep(NA, nrow(C))
+      for (i in 1:nrow(C)) {
+        k = sum(C[i,])
+        p_[i] = bf[i]*pk[k]/choose(p,k)
+      }
+      
+      # normalized posterior
+      posterior.config = (p_)/sum(p_)
+      
+      # PIPs
+      # post.ip = rep(0, p)
+      # for (snp in 1:p) {
+      #   for (config in 1:nrow(C)) {
+      #     if(C[config, snp]==1) {
+      #       post.ip[snp] = post.ip[snp] + posterior.config[config]
+      #     }
+      #   }
+      # }
+      
+      res[iter,ii,hh,2] = posterior.config[true]
+      
+    } #iter
+    
+  } #r
+  
+} #n2
+
+
+y1 = apply(res[,,1,2], 2, mean)
+y2 = apply(res[,,2,2], 2, mean)
+y3 = apply(res[,,3,2], 2, mean)
+y4 = apply(res[,,4,2], 2, mean)
+
+cols = rainbow(11)
+
+plot(r.range, y1, ylim=c(0.0, 0.9), pch = 16,
+     xlab = "correlation between SNPs", col=cols[4],
+     ylab = "posterior of true configuration",
+     main = "error when SNPs with full overlap dropped from calculations (n1 = 10 000)", cex.main=0.9)
+lines(r.range, glm(y1~poly(r.range,2),family = "gaussian")$fitted.values, col = cols[4], lwd=3)
+
+
+points(r.range, y2, col = cols[3], pch = 16)
+lines(r.range, glm(y2~poly(r.range,2),family = "gaussian")$fitted.values, col = cols[3], lwd=3)
+
+points(r.range, y3, col = cols[2], pch = 16)
+lines(r.range, glm(y3~poly(r.range,2),family = "gaussian")$fitted.values, col = cols[2], lwd=3)
+
+points(r.range, y4, col = cols[1], pch = 16)
+lines(r.range, glm(y4~poly(r.range,2),family = "gaussian")$fitted.values, col = cols[1], lwd=3)
+
+#lines(r.range, glm(apply(res[,,4,1], 2, mean)~poly(r.range,2), family="gaussian" )$fitted.values, col=1, lwd=3)
+
+legend("bottomleft", legend = c("8000","7000", "6000", "5000"), title = "n2", col=cols[4:1],lwd=c(3,3,3,3))
+```
+
+

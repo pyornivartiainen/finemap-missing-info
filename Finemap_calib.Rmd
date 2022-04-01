@@ -1,0 +1,274 @@
+---
+title: "Calibrating Finemap Output to Missing Data"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{R include=FALSE}
+geno.2loci <- function(n, r, mafs, return.geno = TRUE){
+  #INPUT:
+  # n, individuals
+  # r, correlation coefficient between the alleles on the same haplotype of the two loci
+  # mafs, MAFs of the two loci
+  #OUTPUT:
+  # if return.geno=TRUE: n x 2 matrix of GENOTYPES of n individuals at 2 loci
+  # if return.geno=FALSE: (2n) x 2 matrix of HAPLOTYPES of n individuals (2n haplotypes) at 2 loci
+  stopifnot( r >= (-1) & r <= 1 )
+  stopifnot( length(mafs) == 2 )
+  stopifnot( all(mafs > 0) & all(mafs <= 0.5) )
+  stopifnot( n > 0)
+
+  #Label SNPs and alleles so that a and b are minor alleles and freq a <= freq b.
+  #At the end, possibly switch the order of SNPs back to the one given by the user.
+  f.a = min(mafs) # maf at SNP1
+  f.b = max(mafs)  # maf at SNP2
+
+  #With these parameters, the possible LD coefficient r has values in the interval:
+  r.min = max( -1, -sqrt(f.a/(1-f.a)*f.b/(1-f.b)) )
+  r.max = min( 1, sqrt(f.a/(1-f.a)/f.b*(1-f.b)) )
+  #c(r.min,r.max)
+  #Check that r is from this interval
+  if(r < r.min | r > r.max) stop(paste0("with these mafs r should be in (",r.min,",",r.max,")"))
+
+  # Alleles SNP1: A (major) and a (minor); SNP2: B (major) and b (minor).
+  # Compute conditional probabilities for allele 'a' given allele at locus 2:
+  q0 = f.a - r*sqrt(f.a*(1-f.a)*f.b/(1-f.b))         #P(a|B)
+  q1 = f.a + (1-f.b)*r*sqrt(f.a*(1-f.a)/f.b/(1-f.b)) #P(a|b)
+
+  #Compute the four haplotype frequencies:
+  f.ab = f.b*q1
+  f.aB = (1-f.b)*q0
+  f.Ab = f.b*(1-q1)
+  f.AB = (1-f.b)*(1-q0)
+  f = c(f.ab,f.aB,f.Ab,f.AB)
+  f #These are the haplotype frequencies in the population.
+  haps = matrix(c(1,1,1,0,0,1,0,0), nrow = 4, ncol = 2, byrow = T) #4 haplotypes in the population.
+
+  #Generate data for n individuals where each individual is measured at these two SNPs:
+  hap.ind = sample(1:4, size = 2*n, replace = T, prob = f) #There are 2*n haplotypes, 2 for each individual
+
+  if(mafs[1] > mafs[2]) haps = haps[,2:1] #Whether to change the order of loci?
+  #Either make genotype matrix by summing the two haplotypes for each individual...
+  if(return.geno) X = haps[hap.ind[1:n],] + haps[hap.ind[(n+1):(2*n)],]
+  if(!return.geno) X = haps[hap.ind,]  #...or return haplotypes as such.
+  return(X)
+}
+```
+
+Consider a standard genome-wide association study (GWAS), where $p$ genetic variants are tested for association with a phenotype $\boldsymbol{y}$ using genotype data $X$ from $n$ individuals. This entails simply estimating coefficients $\lambda_i$ from the linear model
+$$
+\boldsymbol{y}=\lambda_0+\sum_{i=1}^p \boldsymbol{x}_i \lambda_i + \boldsymbol{\varepsilon}.
+$$
+Equivalently, one can fit $p$ separate univariate linear models $\boldsymbol{y}=\beta_0+\boldsymbol{x}_i \beta_i + \varepsilon$ and use the $p\times p$ correlation matrix $\boldsymbol{R}=\boldsymbol{X^TX}/(p-1)$ to recover the causal effects $\lambda_i$ from the marginal effects $\beta_i$ by the formula $\boldsymbol{\lambda}=\boldsymbol{R}^{-1}\boldsymbol{\beta}$. 
+
+Unfortunately, in high-dimensional cases, simple linear regression is often unable to separate causal variants from highly correlated proxies, and can even break down due to multicollinearity and inadequate sample size. It can thus be computationally intractable or downright impossible to determine the exact set of causal variants. The FINEMAP algorithm aims to give a probabilistic answer to this problem using a Bayesian framework. FINEMAP computes Bayes factors for different causal configurations of SNPs, and normalizes these Bayes factors over the set of all possible causal configurations to assign each SNP a _posterior inclusion probability_ (PIP), i.e. the probability of being causal. If the number of predictors is large, it is not feasible to normalize over all possible causal configurations, and thus a Shotgun Stochastic Search (SSS) is used to find a subset of configurations that covers most of the posterior probability.  
+
+The full data $X$ and $y$ are not needed to run FINEMAP; one only needs the univariate GWAS results $\hat{\beta}$ and SE$(\hat{\beta})$, as well as the covariance matrix $\boldsymbol{X^TX}$, which can be estimated from a reference panel. These data are much more readily available than the raw genotype-phenotype data, which may have restricted access due to privacy concerns. However, to perform finemapping with summary statistics and reference data, one must consider possible imbalances and mismatches between the data used. Namely, if different predictors have been measured with varying accuracy, finemapping results can become unreliable. This can occur, for instance, if sample size or imputation quality varies across SNPs. 
+
+In this text we will present a simple theoretical scenario in which missing data leads to unreliable finemapping results. We will then discuss ways to alleviate this problem by calibrating FINEMAP to account for missing data.
+
+Consider two SNPs, A and B, with minor allele frequencies $f_A=f_B=0.4$ and correlation $r=$ cor$(x_A,x_B)=0.8$
+Suppose a phenotype is determined by
+$$
+y=\lambda_0+\lambda_A x_A+\lambda_B x_B + \varepsilon,
+$$
+Assume further that we know that exactly one of the SNPs is causal. Thus we specify two possible causal configurations: $H_A$: A is causal, and $H_B$: B is causal. In such a low-dimensional case, running FINEMAP means simply computing Bayes factors for both configurations against the null model, and normalizing these Bayes factors over their sum, which yields the posterior probability of each SNP being the causal one. 
+
+Let's run FINEMAP 1000 times with $\lambda_A=0.04$, $\lambda_B=0.0$ and look at the distribution of posterior inclusion probabilities for the true causal SNP A.
+
+```{R echo=FALSE}
+pAs.nomissing = c()
+for (run in 1:1000) {
+  n = 10000
+  r = 0.8  # cor(x1, x2) #0.8
+  tau = 0.04 # we will use the same prior variance tau in both the "real" GWAS and the consequent model fittings.
+  mafs = c(0.4, 0.4)
+  lambda = c(0.04, 0.0)  # true causal effects of SNPs
+  
+  mask.prop = 0 #0.4
+  ind = matrix(TRUE, ncol = 2, nrow = n)
+  ind[1:round(mask.prop*n),1] = FALSE
+  
+  X = geno.2loci(n, r, mafs, return.geno = T) #generate 2-locus genotypes
+  y = scale(X %*% lambda + rnorm(n, 0, sqrt(1-var(X %*% lambda)) ))
+  
+  uni = c()
+  for(ii in 1:ncol(X)){
+    uni = rbind(uni, summary(lm(y[ind[,ii]] ~ X[ind[,ii],ii]))$coeff[2, c(1,2,4)]) #collect beta, SE, P-val of SNP1
+  }
+  
+  prior.v = 0.04^2
+  log.bf = dnorm(uni[,1], 0, sqrt(prior.v + uni[,2]^2), log = T) - dnorm(uni[,1], 0, uni[,2], log = T)
+  bf = exp(log.bf - max(log.bf))
+  pA.obs = bf/sum(bf) # the real pA = P(A causal | Data) estimated by FINEMAP
+  pA.obs = pA.obs[1]
+  lambda.obs = uni[1,1] # the estimate of lambda_A
+  #print(pA.obs)
+  pAs.nomissing = c(pAs.nomissing, pA.obs)
+}
+hist(pAs.nomissing, breaks=50, freq=F, col=4, xlab= "pA (posterior inclusion probability)", main = "distribution of pA-statistics")
+```
+
+Even with a high correlation and a rather small effect size, FINEMAP nearly always prefers the correct model. But what happens if the true causal SNP has fewer observations than its highly correlated proxy? Let's run the previous simulation again, this time with 40% of data points masked for SNP A.
+
+```{R echo=FALSE}
+pAs.missing = c()
+for (run in 1:1000) {
+  n = 10000
+  r = 0.8  # cor(x1, x2) #0.8
+  tau = 0.04 # we will use the same prior variance tau in both the "real" GWAS and the consequent model fittings.
+  mafs = c(0.4, 0.4)
+  lambda = c(0.04, 0.0)  # true causal effects of SNPs
+  
+  mask.prop = 0.4 #0.4
+  ind = matrix(TRUE, ncol = 2, nrow = n)
+  ind[1:round(mask.prop*n),1] = FALSE
+  
+  X = geno.2loci(n, r, mafs, return.geno = T) #generate 2-locus genotypes
+  y = scale(X %*% lambda + rnorm(n, 0, sqrt(1-var(X %*% lambda)) ))
+  
+  uni = c()
+  for(ii in 1:ncol(X)){
+    uni = rbind(uni, summary(lm(y[ind[,ii]] ~ X[ind[,ii],ii]))$coeff[2, c(1,2,4)]) #collect beta, SE, P-val of SNP1
+  }
+  
+  prior.v = 0.04^2
+  log.bf = dnorm(uni[,1], 0, sqrt(prior.v + uni[,2]^2), log = T) - dnorm(uni[,1], 0, uni[,2], log = T)
+  bf = exp(log.bf - max(log.bf))
+  pA.obs = bf/sum(bf) # the real pA = P(A causal | Data) estimated by FINEMAP
+  pA.obs = pA.obs[1]
+  lambda.obs = uni[1,1] # the estimate of lambda_A
+  #print(pA.obs)
+  pAs.missing = c(pAs.missing, pA.obs)
+}
+hist(pAs.missing, breaks=50, freq=F, col=4, xlab= "pA (posterior inclusion probability)", main = "distribution of pA-statistics (A 40% missing)")
+```
+
+Now FINEMAP prefers the wrong model slightly more often than the right one. This happens when the proportion of missing data in A is greater than $1-r^2$ (the proportion of variance in $x_A$ not explained by $x_B$), so SNP B actually carries more information about SNP A than SNP A itself.
+
+To alleviate this problem, we can try to calibrate the FINEMAP output pA to account for the missing data. To this end, we sample pA statistics under the two models $H_A$ and $H_B$. Assuming a uniform prior, we can use the observed pA distributions and Bayes' Theorem to calculate the probability of A being causal given that pA was observed:
+\begin{align}
+P(\text{A causal}\mid pA) =\frac{P(pA\mid \text{A causal}) }{P(pA\mid\text{A causal})+P(pA\mid\text{B causal})}.
+\end{align}
+
+The calibrated probability depends on the true effect size. We will perform the calculations for a range of possible effect sizes and visualise the results as a function of $\lambda$.
+
+To estimate $P(pA\mid \text{A causal})$, we could generate two-locus genotype data and simulate a GWAS, but it is much more efficient to sample the marginal effects directly from a multinormal distribution.
+
+Let the sample sizes of the two SNPs be $n_A$ and $n_B$, and denote their overlap by $n_{AB}$. We now have
+$$
+\text{cor}(\hat{\beta}_A, \hat{\beta}_B)=\frac{n_{AB}}{\sqrt{n_An_B}}r.
+$$
+The sampling of the betas can then be done as follows.
+
+```{R}
+library(MASS)
+niter = 1000
+n = 10000
+mask.prop = 0.4
+nA = (1-mask.prop)*n
+nB = n
+nAB = nA
+r = 0.8  # cor(x1, x2) #0.8
+tau = 0.04 
+mafs = c(0.4, 0.4)
+
+lambda.shared = seq(0.0,0.2, length.out = 21)
+
+# causal A
+logpAs.samp.Acausal = matrix(NA, length(lambda.shared), niter)
+for (k in 1:length(lambda.shared)) {
+  lambda.A = lambda.shared[k]
+  sigma2.eps.A = 1-lambda.A^2*2*mafs[1]*(1-mafs[1])
+  var.bhat.a = sigma2.eps.A/(2*nA*mafs[1]*(1-mafs[1]))
+  sigma2.eps.B = 1-(r*lambda.A)^2*2*mafs[2]*(1-mafs[2])
+  var.bhat.b = sigma2.eps.B/(2*nB*mafs[2]*(1-mafs[2]))
+  corAB = nAB*r/sqrt(nA*nB)
+  covAB = corAB*sqrt(var.bhat.a*var.bhat.b)
+  betas = mvrnorm(n=niter, mu = c(lambda.A, r*lambda.A), Sigma = matrix(c(var.bhat.a, covAB,
+                                                                          covAB, var.bhat.b),nrow=2))
+  for (j in 1:nrow(betas)) {
+    log.bf = dnorm(betas[j,], 0, sqrt(prior.v+c(var.bhat.a, var.bhat.b)), log = T) - 
+      dnorm(betas[j,], 0, sqrt(c(var.bhat.a, var.bhat.b)), log = T)
+    bf = exp(log.bf-max(log.bf))
+    pA = bf/sum(bf)
+    pA = pA[1]
+    logpAs.samp.Acausal[k,j] = log(pA/(1-pA))
+  }
+}
+
+# causal B
+logpAs.samp.Bcausal = matrix(NA, length(lambda.shared), niter)
+for (k in 1:length(lambda.shared)) {
+  lambda.B = lambda.shared[k]
+  sigma2.eps.A = 1-(r*lambda.B)^2*2*mafs[1]*(1-mafs[1])
+  var.bhat.a = sigma2.eps.A/(2*nA*mafs[1]*(1-mafs[1]))
+  sigma2.eps.B = 1-lambda.B^2*2*mafs[2]*(1-mafs[2])
+  var.bhat.b = sigma2.eps.B/(2*nB*mafs[2]*(1-mafs[2]))
+  corAB = nAB*r/sqrt(nA*nB)
+  covAB = corAB*sqrt(var.bhat.a*var.bhat.b)
+  betas = mvrnorm(n=niter, mu = c(r*lambda.B, lambda.B), Sigma = matrix(c(var.bhat.a, covAB,
+                                                                          covAB, var.bhat.b),nrow=2))
+  for (j in 1:nrow(betas)) {
+    log.bf = dnorm(betas[j,], 0, sqrt(prior.v+c(var.bhat.a, var.bhat.b)), log = T) - 
+      dnorm(betas[j,], 0, sqrt(c(var.bhat.a, var.bhat.b)), log = T)
+    bf = exp(log.bf-max(log.bf))
+    pA = bf/sum(bf)
+    pA = pA[1]
+    logpAs.samp.Bcausal[k,j] = log(pA/(1-pA))
+  }
+}
+```
+
+Now suppose our initial "real" GWAS gave us the following results:
+
+```{R}
+pA.obs = 0.357257
+lambda.obs = 0.03013271 # observed lambda_A
+```
+
+We can then estimate $P(pA\mid \text{A causal})$ and $P(pA\mid \text{B causal})$ from the observed densities:
+
+```{R}
+epsilon = 0.05
+log.odds.obs = log(pA.obs/(1-pA.obs))
+
+pA_given_A_causal.samp = matrix(NA, length(lambda.shared), 2)
+for (ii in 1:nrow(logpAs.samp.Acausal)) {
+  #f = density(res[ii,], from=0, to=1) #distribution of pAs 
+  #normalizer = with(f, sum(y * diff(x)[1])) # f doesn't integrate to 1!
+  f2 = density(logpAs.samp.Acausal[ii,], from = log.odds.obs-epsilon, to = log.odds.obs+epsilon, n=1024)
+  #f2$y = (f2$y) / normalizer # normalize so density integrates to 1 over [0,1]
+  pA_given_A_causal.samp[ii,1] = with(f2, sum(y * diff(x)[1])) # estimate from cdf
+  pA_given_A_causal.samp[ii,2] = approx(f2$x, f2$y, xout = log.odds.obs)$y # estimate from pdf
+}
+
+pA_given_B_causal.samp = matrix(NA, length(lambda.shared), 2)
+for (ii in 1:nrow(logpAs.samp.Bcausal)) {
+  #f = density(resB[ii,], from=0, to=1, bw="nrd0", adjust=0.3) #distribution of pAs 
+  #normalizer = with(f, sum(y * diff(x)[1])) # f doesn't integrate to 1!
+  f2 = density(logpAs.samp.Bcausal[ii,], from = log.odds.obs-epsilon, to = log.odds.obs+epsilon, n=1024)
+  #f2$y = (f2$y) / normalizer # normalize so density integrates to 1 over [0,1]
+  pA_given_B_causal.samp[ii,1] = with(f2, sum(y * diff(x)[1]))
+  pA_given_B_causal.samp[ii,2] = approx(f2$x, f2$y, xout = log.odds.obs)$y
+}
+```
+
+Now we are ready for the final Bayesian calculation and plotting of the calibrated probabilities.
+
+```{R}
+p_A_causal_given_pA.cdf.samp = pA_given_A_causal.samp[,1] / (pA_given_A_causal.samp[,1] + pA_given_B_causal.samp[,1] )
+plot(lambda.shared, loess(p_A_causal_given_pA.cdf.samp ~ lambda.shared, span = 0.3)$fitted, type="l", lwd=2,
+     ylim=c(0,1),xlab="effect size of SNP A", ylab = "P(A causal)",
+     main = paste("P(A causal | pA = ",round(pA.obs,2)," observed)\n(A 40% missing, r =",r,") (samp)")) 
+abline(v=lambda.obs, col=2, lty=2)
+abline(h=pA.obs, lty=2)
+legend("bottomright", c("pA observed", "lambda_A observed"), lty=c(2,2), col=c(1,2), cex=0.7)
+```
+
+
